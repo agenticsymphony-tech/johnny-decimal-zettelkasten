@@ -42,19 +42,10 @@ echo "======================================================="
 echo "  node    $(node --version)"
 echo "  git     $(git --version | awk '{print $3}')"
 echo "  jq      $(jq --version)"
-echo "  sqlite3 $(sqlite3 --version | awk '{print $1}')"
 echo "  HOME    $HOME"
 
 # --- Set up an isolated working copy ---------------------------------------
 section "0. Working copy"
-
-# Clear any session logs left by a previous run. A fresh container gets this
-# for free, but local runs reuse HOME and would otherwise see stale logs and
-# report false results.
-rm -rf "$HOME/.claude/projects" \
-       "$HOME/.codex/sessions" \
-       "$HOME/.gemini/tmp" \
-       "$HOME/.local/share/opencode"
 
 rm -rf "$WORK_DIR"
 mkdir -p "$(dirname "$WORK_DIR")"
@@ -79,9 +70,7 @@ mapfile -t SH_FILES < <(find . -name '*.sh' \
   -not -path './config/*')
 check "shellcheck (${#SH_FILES[@]} scripts)" shellcheck --severity=warning "${SH_FILES[@]}"
 
-for f in .claude/settings.json opencode.json; do
-  check "valid JSON: $f" jq -e . "$f"
-done
+check "valid JSON: opencode.json" jq -e . opencode.json
 
 check "opencode.json registers obsidian-vault-mcp" \
   jq -e '.mcp["obsidian-vault-mcp"].command | index("@jabez007/obsidian-vault-mcp@2.1.0")' opencode.json
@@ -96,7 +85,7 @@ try:
     cfg = tomllib.load(open(cfg_path, "rb"))
     agents = [k for k in cfg["agents"] if k != "max_depth"]
     assert len(agents) == 8, f"expected 8 agents, got {len(agents)}"
-    assert "SessionStart" in cfg["hooks"], "SessionStart hook missing"
+    assert "hooks" not in cfg, "Codex config still registers hooks"
 except Exception as e:
     print(e); sys.exit(1)
 PY
@@ -120,11 +109,21 @@ fi
 
 for h in claude gemini; do
   ok=1
-  for f in copilot-instructions johnny-decimal philosophy zettelkasten; do
-    cmp -s "references/librarian/$f.md" ".$h/skills/librarian-vault-manager/references/$f.md" || ok=0
+  for f in references/librarian/*.md; do
+    cmp -s "$f" ".$h/skills/librarian-vault-manager/references/$(basename "$f")" || ok=0
   done
   [ "$ok" = 1 ] && pass "doctrine identical in .$h/skills/" || fail "doctrine identical in .$h/skills/"
 done
+
+# Promotion is the only route from a session into the vault, so every entry
+# point that can file knowledge must point at it.
+promo_ok=1
+for f in AGENTS.md .agents/skills/librarian-vault-manager/SKILL.md \
+         .agents/agents/librarian.md references/librarian/copilot-instructions.md; do
+  grep -q 'knowledge-promotion.md' "$f" || { promo_ok=0; echo "       $f does not reference knowledge-promotion.md"; }
+done
+[ "$promo_ok" = 1 ] && pass "promotion doctrine is referenced from every entry point" \
+  || fail "promotion doctrine is referenced from every entry point"
 
 for d in .claude/agents .gemini/agents .opencode/agents .codex/agents; do
   n=$(find "$d" -type f | wc -l)
@@ -196,8 +195,6 @@ scope_ok=1
 for src in .agents/agents/*.md; do
   grep -qE '^capabilities:.*(write|edit)' "$src" || continue
   n=$(basename "$src" .md)
-  # daily-reviewer writes freely by design; everything else must be scoped.
-  [ "$n" = "daily-reviewer" ] && continue
   grep -q '^write_scope:' "$src" || { scope_ok=0; echo "       $n: has write but declares no write_scope"; }
 done
 [ "$scope_ok" = 1 ] && pass "scoped writers declare a write_scope" \
@@ -382,91 +379,548 @@ else
     else
       fail "obsidian_rag_query returns results" "$(tail -3 "$QUERY_LOG" | tr '\n' ' ')"
     fi
+
+    # The Publish step of knowledge promotion, driven over MCP stdio the way an
+    # agent calls it. The CLI cannot carry frontmatter: it reads any value that
+    # starts with "--" as the next flag. An approved note is indexed on write
+    # and found by the next query, and a second create at the same ID is
+    # refused rather than overwritten.
+    PROMO="LIFE/20-Personal Development/21-Learnings and Skills/LIFE.21.0F.md"
+    PROMO_BODY=$'---\nentities: [harness-fixture, knowledge-promotion]\ncommunities: [LIFE.21]\nstatus: distilled\n---\n[[LIFE.00.00]]\n\n# Approved promotions are indexed on write\n\nThe quokka-lighthouse fixture proves that an approved note is searchable\nas soon as it is written.\n'
+    promo_call() {
+      jq -nc --argjson id "$1" --arg c "$2" --arg p "$PROMO" --arg v "$VAULT" --arg w "$WORK_DIR" \
+        '{jsonrpc:"2.0", id:$id, method:"tools/call", params:{name:"obsidian_create_note",
+          arguments:{file_path:$p, content:$c, vault_path:$v, workspace_path:$w, vault_id:"test_example"}}}'
+    }
+    PROMO_LOG=$(mktemp)
+    # Each request waits for the server's reply to the one before, so the
+    # duplicate create never races the first write and its re-index.
+    promo_wait() {
+      for _ in $(seq 1 60); do
+        jq -se --argjson id "$1" 'any(.[]; .id==$id)' "$PROMO_LOG" >/dev/null 2>&1 && return
+        sleep 1
+      done
+      return 1
+    }
+    # A wait that times out ends the input, so no later request goes out
+    # before the server has answered the one before it.
+    {
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"harness","version":"1"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+      promo_call 2 "$PROMO_BODY"
+      promo_wait 2 || exit
+      promo_call 3 "replaced"
+      promo_wait 3 || exit
+    } | $MCP_CMD 2>/dev/null >"$PROMO_LOG" || true
+
+    PROMO_HIT=$($MCP_CMD obsidian_rag_query --query "quokka-lighthouse fixture" --path "$VAULT" \
+                  --workspace_path "$WORK_DIR" --vault_id test_example 2>/dev/null | grep '^File:' | head -1)
+    if jq -se 'any(.[]; .id==2 and .result.isError != true)' "$PROMO_LOG" >/dev/null 2>&1 \
+       && cmp -s <(printf '%s' "$PROMO_BODY") "$VAULT/$PROMO" \
+       && [[ "$PROMO_HIT" == *LIFE.21.0F* ]]; then
+      pass "promoted note is written and ranked first by rag_query"
+    else
+      fail "promoted note is written and ranked first by rag_query" "top hit: ${PROMO_HIT:-none}"
+    fi
+    if jq -se 'any(.[]; .id==3 and .result.isError == true)' "$PROMO_LOG" >/dev/null 2>&1 \
+       && cmp -s <(printf '%s' "$PROMO_BODY") "$VAULT/$PROMO"; then
+      pass "promotion refuses to overwrite an existing ID"
+    else
+      fail "promotion refuses to overwrite an existing ID"
+    fi
+    rm -f "$PROMO_LOG" "${VAULT:?}/${PROMO:?}"
   else
     fail "obsidian_rag_index --force_reindex true" "$(tail -5 "$INDEX_LOG" | tr '\n' ' ')"
   fi
 fi
 
-# --- 4. Agent memory context ------------------------------------------------
-section "4. Agent memory context"
+# --- 4. Agent memory is retired -------------------------------------------
+section "4. Agent memory is retired"
 
-CTX=$(bash scripts/agent-memory-context.sh 2>&1)
-echo "$CTX" | grep -q 'Agent Memory SOPs' && pass "context script emits SOPs" \
-  || fail "context script emits SOPs"
-echo "$CTX" | grep -q 'obsidian-vault-mcp' && pass "context references the v2 server key" \
-  || fail "context references the v2 server key"
-echo "$CTX" | grep -q 'Recent Activity Map' && pass "context emits Recent Activity Map" \
-  || fail "context emits Recent Activity Map"
+# The vault no longer injects session context or asks agents to log sessions.
+# Any of these files coming back means the coupling came back with it.
+retired_ok=1
+for f in scripts/agent-memory-context.sh scripts/compile-sessions.sh \
+         .claude/hooks/session-start.sh .codex/hooks/session-start.sh \
+         .claude/skills/librarian-vault-manager/scripts \
+         .gemini/skills/librarian-vault-manager/scripts; do
+  [ -e "$f" ] && { retired_ok=0; echo "       still present: $f"; }
+done
+[ "$retired_ok" = 1 ] && pass "retired hook, context, and compiler files are gone" \
+  || fail "retired hook, context, and compiler files are gone"
 
-# The example vault's log uses the inline '**Goal:**' form.
-if echo "$CTX" | grep -q 'Initialize the AGNT Procedural Memory system'; then
-  pass "goal extracted from inline '**Goal:**' form"
+if [ ! -f .claude/settings.json ] || ! jq -e '.hooks.SessionStart' .claude/settings.json >/dev/null 2>&1; then
+  pass "Claude Code has no SessionStart hook"
 else
-  fail "goal extracted from inline '**Goal:**' form" "$(echo "$CTX" | tail -2 | tr '\n' ' ')"
+  fail "Claude Code has no SessionStart hook"
 fi
 
-# Synthesize a heading-style log to cover the other format.
-mkdir -p "$VAULT/JRNL/AGNT"
-cat >"$VAULT/JRNL/AGNT/2099-01-01-0000.md" <<'LOG'
+if grep -q 'hooks' .codex/config.toml; then
+  fail "Codex config has no hooks"
+else
+  pass "Codex config has no hooks"
+fi
+
+if grep -qE 'SessionStart \+=|cat >"\$HOOK_SCRIPT"' .gemini/setup-environment.sh; then
+  fail "Gemini setup installs no global hook"
+else
+  pass "Gemini setup installs no global hook"
+fi
+
+# The sample vault demonstrates the knowledge system only.
+if [ -z "$(find vaults/example -path '*AGNT*' -print -quit)" ] \
+   && ! grep -rq 'Agent Staff Report' vaults/example; then
+  pass "sample vault carries no agent-memory content"
+else
+  fail "sample vault carries no agent-memory content"
+fi
+
+# Nothing that ships agent instructions may tell an agent to write session logs
+# or procedural rules into the vault. The migration doctrine may name the
+# legacy folders, so it is the one place they can appear.
+if grep -rnE 'Shutdown Sequence|Boot Sequence|Recent Activity Map|Log the session to|compile-sessions' \
+     AGENTS.md CLAUDE.md .agents references .claude .codex .gemini .opencode opencode.json 2>/dev/null; then
+  fail "no agent instruction asks for session logging"
+else
+  pass "no agent instruction asks for session logging"
+fi
+
+# A memory provider is optional and configured outside this repository, so no
+# script, setup step, or agent instruction may depend on one.
+if grep -rniE 'hindsight' scripts .agents references .claude .codex .gemini .opencode \
+     opencode.json AGENTS.md CLAUDE.md test/test-index-hooks.py 2>/dev/null; then
+  fail "no script or agent asset references a memory provider"
+else
+  pass "no script or agent asset references a memory provider"
+fi
+
+# --- 4a. Legacy Gemini hook removal ---
+HOOK_HOME=$(mktemp -d)
+mkdir -p "$HOOK_HOME/.gemini/hooks"
+printf '#!/bin/bash\n# Generated by johnny-decimal-zettelkasten/.gemini/setup-environment.sh.\n' \
+  >"$HOOK_HOME/.gemini/hooks/agent-memory-boot.sh"
+printf '#!/bin/bash\n# agent-memory-context.sh\n# Canonical Agent Memory boot context, shared by every hook.\n' \
+  >"$HOOK_HOME/.gemini/hooks/agent-memory-context.sh"
+printf 'keep me\n' >"$HOOK_HOME/.gemini/hooks/someone-elses-hook.sh"
+cat >"$HOOK_HOME/.gemini/settings.json" <<'JSON'
+{"theme":"dark","hooks":{"SessionStart":[
+  {"matcher":"*"},
+  {"matcher":"*","hooks":[{"name":"agent-memory-boot","type":"command","command":"/old"}]},
+  {"matcher":"x","hooks":[{"name":"other","type":"command","command":"/o"}]}]}}
+JSON
+SETTINGS_BEFORE=$(sha256sum <"$HOOK_HOME/.gemini/settings.json")
+HOME="$HOOK_HOME" bash scripts/migrate-agent-memory.sh legacy-hooks >/dev/null 2>&1
+if [ "$(sha256sum <"$HOOK_HOME/.gemini/settings.json")" = "$SETTINGS_BEFORE" ] \
+   && [ -f "$HOOK_HOME/.gemini/hooks/agent-memory-boot.sh" ]; then
+  pass "legacy-hooks is a dry run without --apply"
+else
+  fail "legacy-hooks is a dry run without --apply"
+fi
+HOME="$HOOK_HOME" bash scripts/migrate-agent-memory.sh legacy-hooks --apply >/dev/null 2>&1
+if jq -e '[.hooks.SessionStart[]?.hooks[]? | select(.name == "agent-memory-boot")] | length == 0' \
+     "$HOOK_HOME/.gemini/settings.json" >/dev/null \
+   && jq -e '.theme == "dark" and ([.hooks.SessionStart[]?.hooks[]? | select(.name == "other")] | length == 1)' \
+     "$HOOK_HOME/.gemini/settings.json" >/dev/null \
+   && [ -f "$HOOK_HOME/.gemini/settings.json.agent-memory-backup" ]; then
+  pass "legacy-hooks removes only the retired registration and keeps a backup"
+else
+  fail "legacy-hooks removes only the retired registration and keeps a backup" \
+       "$(tr -d '\n' <"$HOOK_HOME/.gemini/settings.json")"
+fi
+if [ ! -e "$HOOK_HOME/.gemini/hooks/agent-memory-boot.sh" ] \
+   && [ ! -e "$HOOK_HOME/.gemini/hooks/agent-memory-context.sh" ] \
+   && [ -f "$HOOK_HOME/.gemini/hooks/someone-elses-hook.sh" ]; then
+  pass "legacy-hooks deletes only the files the old setup generated"
+else
+  fail "legacy-hooks deletes only the files the old setup generated"
+fi
+rm -rf "$HOOK_HOME"
+
+# --- 4b. Legacy content migration ---
+# A synthetic vault with every legacy shape: rules, a clean session log, a
+# session log with a credential-shaped line, a log Git never tracked, a Base, a
+# human daily note that embeds a log, and a curated note that must not move.
+MIG=$(mktemp -d)
+MV="$MIG/repo/vaults/demo"
+PRIV="$MIG/private/demo"
+mkdir -p "$MV/AGNT/00-IDX" "$MV/AGNT/10-Procedural_Rules/11-Coding" "$MV/JRNL/AGNT" \
+         "$MV/JRNL/2026/04" "$MV/_SYS" "$MV/LIFE/00-IDX" "$MV/LIFE/20-Personal Development/21-Learnings"
+printf '[[00.00]]\n\n# AGNT System Index\n' >"$MV/AGNT/00-IDX/AGNT.00.00.md"
+cat >"$MV/AGNT/10-Procedural_Rules/11-Coding/AGNT.11.01-Pytest-is-preferred.md" <<'NOTE'
 ---
+entities: [pytest]
+communities: [Agent Procedural Memory]
 status: crystallized
 ---
+[[AGNT.00.00]]
 
-# Session Log: 2099-01-01
+# AGNT.11.01 Pytest is preferred
+NOTE
+printf '# Session log\n\n**Goal:** Sketch the demo vault.\n' >"$MV/JRNL/AGNT/2026-04-23-1000.md"
+cat >"$MV/JRNL/AGNT/2026-04-24-1500.md" <<'NOTE'
+# Session log
 
-## Goal
-Verify heading style goal extraction works.
+**Goal:** Set up the demo vault.
 
-## Actions Taken
-- None.
-LOG
-HEADING_CTX=$(bash scripts/agent-memory-context.sh 2>&1)
-if echo "$HEADING_CTX" | grep -q 'Verify heading style goal extraction works'; then
-  pass "goal extracted from '## Goal' heading form"
+api_key = example-not-a-real-key
+NOTE
+printf 'filters:\n  and:\n    - file.folder.contains("AGNT")\n' >"$MV/_SYS/JDEX_AGNT.base"
+cat >"$MV/JRNL/2026/04/2026-04-24.md" <<'NOTE'
+# Friday, April 24, 2026
+
+## Log
+
+- Wrote about testing.
+- ![[JRNL/AGNT/2026-04-24-1500#Goal]]
+NOTE
+cat >"$MV/LIFE/20-Personal Development/21-Learnings/LIFE.21.01-Tests-document-intent.md" <<'NOTE'
+---
+entities: [testing]
+communities: [Learnings]
+status: distilled
+---
+[[LIFE.00.00]]
+
+# Tests document intent
+NOTE
+(cd "$MIG/repo" && git init -q . && git config user.email t@example.com && git config user.name T \
+  && git add -A && git commit -qm base)
+BASE_COMMIT=$(git -C "$MIG/repo" rev-parse HEAD)
+printf '# Session log\n\nA private client conversation.\n' >"$MV/JRNL/AGNT/2026-04-25-0900.md"
+DRAFT_BLOB=$(git -C "$MIG/repo" hash-object "$MV/JRNL/AGNT/2026-04-25-0900.md")
+SECRET_BLOB=$(git -C "$MIG/repo" rev-parse HEAD:vaults/demo/JRNL/AGNT/2026-04-24-1500.md)
+MIGRATE="$WORK_DIR/scripts/migrate-agent-memory.sh"
+tree_sum() { (cd "$MV" && find . -type f -not -path './.archive/*' | LC_ALL=C sort | while IFS= read -r f; do sha256sum "$f"; done | sha256sum); }
+# Content hashes of every tracked file, ignoring the blobs named as arguments.
+blob_sum() { git -C "$MIG/repo" ls-files -s | awk -v skip=" $* " 'index(skip, " " $2 " ") == 0 {print $2}' | LC_ALL=C sort | sha256sum; }
+BASE_TREE=$(tree_sum)
+BASE_STATUS=$(git -C "$MIG/repo" status --porcelain)
+DAILY_SUM=$(sha256sum <"$MV/JRNL/2026/04/2026-04-24.md")
+LIFE_SUM=$(sha256sum <"$MV/LIFE/20-Personal Development/21-Learnings/LIFE.21.01-Tests-document-intent.md")
+
+INV=$(HOME="$MIG" bash "$MIGRATE" inventory --vault "$MV" 2>&1)
+if echo "$INV" | grep -q 'Procedural rules (AGNT/): 1' \
+   && echo "$INV" | grep -q 'Session logs (JRNL/AGNT/): 3' \
+   && echo "$INV" | grep -q 'JRNL/AGNT/2026-04-24-1500.md <- JRNL/2026/04/2026-04-24.md' \
+   && echo "$INV" | grep -q 'Possible credentials or private data: 1' \
+   && echo "$INV" | grep -q 'Bound for the private archive, outside Git: 2' \
+   && ! echo "$INV" | grep -q 'Commit these before archiving'; then
+  pass "inventory classifies rules, logs, inbound links, credentials, and private files"
 else
-  fail "goal extracted from '## Goal' heading form" \
-       "map was: $(echo "$HEADING_CTX" | grep '^| 2099' || echo '<no 2099 row in map>')"
+  fail "inventory classifies rules, logs, inbound links, credentials, and private files" "$(echo "$INV" | head -20 | tr '\n' ' ')"
 fi
-rm -f "$VAULT/JRNL/AGNT/2099-01-01-0000.md"
+TSV=$(HOME="$MIG" bash "$MIGRATE" inventory --vault "$MV" --format tsv 2>&1)
+[ "$(echo "$TSV" | head -1 | cut -f1-3)" = "$(printf 'path\tkind\tgit_state')" ] && [ "$(echo "$TSV" | wc -l)" -eq 7 ] \
+  && echo "$TSV" | awk -F'\t' '$1 == "JRNL/AGNT/2026-04-25-0900.md" && $3 == "untracked" && $6 == "private:untracked"' | grep -q . \
+  && pass "inventory --format tsv emits one row per legacy file with its destination" \
+  || fail "inventory --format tsv emits one row per legacy file with its destination" "$(echo "$TSV" | tr '\n' '|')"
 
-for hook in .codex/hooks/session-start.sh .claude/hooks/session-start.sh; do
-  if bash "$hook" 2>/dev/null | jq -e '.hookSpecificOutput.hookEventName == "SessionStart"' >/dev/null; then
-    pass "$hook emits valid SessionStart JSON"
-  else
-    fail "$hook emits valid SessionStart JSON"
-  fi
+HOME="$MIG" bash "$MIGRATE" archive --vault "$MV" --private-dir "$PRIV" >/dev/null 2>&1
+rc=$?
+[ "$(tree_sum)" = "$BASE_TREE" ] && [ "$(git -C "$MIG/repo" status --porcelain)" = "$BASE_STATUS" ] \
+  && [ ! -e "$MIG/private" ] \
+  && pass "inventory and archive dry run change nothing" \
+  || fail "inventory and archive dry run change nothing"
+[ "$rc" = 2 ] && pass "archive refuses while curated notes link to legacy content" \
+  || fail "archive refuses while curated notes link to legacy content" "exit $rc"
+
+OUT=$(HOME="$MIG" bash "$MIGRATE" archive --vault "$MV" --apply --allow-inbound-links 2>&1)
+rc=$?
+[ "$rc" = 2 ] && [ "$(tree_sum)" = "$BASE_TREE" ] && echo "$OUT" | grep -q 'no --private-dir' \
+  && pass "archive refuses files that must leave Git when no --private-dir is given" \
+  || fail "archive refuses files that must leave Git when no --private-dir is given" "exit $rc"
+
+HOME="$MIG" bash "$MIGRATE" archive --vault "$MV" --apply --allow-inbound-links --yes \
+  --private-dir "$MIG/repo/agent-archive" >/dev/null 2>&1
+rc=$?
+[ "$rc" = 2 ] && [ "$(tree_sum)" = "$BASE_TREE" ] && [ ! -e "$MIG/repo/agent-archive" ] \
+  && pass "archive refuses a --private-dir inside a Git repository" \
+  || fail "archive refuses a --private-dir inside a Git repository" "exit $rc"
+
+OUT=$(HOME="$MIG" bash "$MIGRATE" archive --vault "$MV" --private-dir "$PRIV" --private AGNT \
+  --allow-inbound-links 2>&1)
+echo "$OUT" | grep -qF '[requested] AGNT/00-IDX/AGNT.00.00.md' \
+  && echo "$OUT" | grep -qF '[untracked] JRNL/AGNT/2026-04-25-0900.md' \
+  && echo "$OUT" | grep -qF '[sensitive] JRNL/AGNT/2026-04-24-1500.md' \
+  && pass "archive --private sends a requested folder to the private archive" \
+  || fail "archive --private sends a requested folder to the private archive" "$(echo "$OUT" | tr '\n' '|')"
+
+# A folder name in the middle of a legacy path, or an empty value, matches
+# nothing that private_reason would send to the private archive.
+rcs=""
+for p in 00-IDX ""; do
+  HOME="$MIG" bash "$MIGRATE" archive --vault "$MV" --private-dir "$PRIV" --private "$p" \
+    --allow-inbound-links >/dev/null 2>&1
+  rcs="$rcs $?"
 done
+[ "$rcs" = " 1 1" ] && [ "$(tree_sum)" = "$BASE_TREE" ] \
+  && pass "archive --private accepts only a vault-relative path prefix" \
+  || fail "archive --private accepts only a vault-relative path prefix" "exits:$rcs"
 
-# A failing context script must still yield a diagnostic, not an empty context.
-CTX_BACKUP=$(mktemp)
-cp scripts/agent-memory-context.sh "$CTX_BACKUP"
-printf '#!/bin/bash\necho "simulated failure" >&2\nexit 1\n' >scripts/agent-memory-context.sh
-hook_ok=1
-for hook in .codex/hooks/session-start.sh .claude/hooks/session-start.sh; do
-  ctx=$(bash "$hook" 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext // ""')
-  [ -n "$ctx" ] || hook_ok=0
-done
-[ "$hook_ok" = 1 ] && pass "hooks degrade to a diagnostic when the context script fails" \
-  || fail "hooks degrade to a diagnostic when the context script fails" "got an empty context"
-mv "$CTX_BACKUP" scripts/agent-memory-context.sh
+HOME="$MIG" bash "$MIGRATE" archive --vault "$MV" --scope logs --apply --allow-inbound-links \
+  --private-dir "$PRIV" </dev/null >/dev/null 2>&1
+rc=$?
+[ "$rc" = 2 ] && [ "$(tree_sum)" = "$BASE_TREE" ] && [ ! -e "$MIG/private" ] \
+  && pass "moving files out of Git needs explicit confirmation" \
+  || fail "moving files out of Git needs explicit confirmation" "exit $rc"
 
-# The jq refresh branch must tolerate a SessionStart entry with no hooks array.
-if echo '{"hooks":{"SessionStart":[{"matcher":"*"},{"matcher":"x","hooks":[{"name":"agent-memory-boot","command":"old"}]}]}}' \
-   | jq --arg name "agent-memory-boot" --arg script "/new" '
-       .hooks |= (. // {}) | .hooks.SessionStart |= (. // [])
-       | if any(.hooks.SessionStart[]; (.hooks? // []) | any(.[]; .name == $name)) then
-           .hooks.SessionStart |= map(
-             if (.hooks | type) == "array" then
-               .hooks |= map(if .name == $name then .command = $script else . end)
-             else . end)
-         else . end' >/dev/null 2>&1; then
-  pass "hook registration tolerates entries without a hooks array"
+HOME="$MIG" bash "$MIGRATE" archive --vault "$MV" --scope logs --apply --allow-inbound-links \
+  --private-dir "$PRIV" --yes >/dev/null 2>&1
+if [ ! -e "$MV/JRNL/AGNT" ] && [ -d "$MV/AGNT" ] \
+   && [ -f "$MV/.archive/agent-memory/JRNL/AGNT/2026-04-23-1000.md" ] \
+   && [ ! -e "$MV/.archive/agent-memory/JRNL/AGNT/2026-04-24-1500.md" ] \
+   && [ -f "$PRIV/JRNL/AGNT/2026-04-24-1500.md" ] && [ -f "$PRIV/JRNL/AGNT/2026-04-25-0900.md" ]; then
+  pass "archive --scope logs keeps clean logs in Git and moves the rest to the private archive"
 else
-  fail "hook registration tolerates entries without a hooks array"
+  fail "archive --scope logs keeps clean logs in Git and moves the rest to the private archive"
+fi
+[ "$(stat -c %a "$PRIV" 2>/dev/null || stat -f %Lp "$PRIV")" = 700 ] \
+  && (cd "$PRIV" && awk -F'\t' '$1 == "file" { print $2 "  " $5 }' PRIVATE-MANIFEST.tsv | sha256sum -c --quiet) \
+  && pass "private archive is owner-only and matches its checksums" \
+  || fail "private archive is owner-only and matches its checksums"
+(cd "$MIG/repo" && git commit -qm "archive logs")
+if ! git -C "$MIG/repo" cat-file -e "$DRAFT_BLOB" 2>/dev/null \
+   && ! git -C "$MIG/repo" ls-tree -r HEAD | grep -q -e "$SECRET_BLOB" -e '2026-04-25-0900' \
+   && ! git -C "$MIG/repo" ls-tree -r HEAD --name-only | grep -q 'agent-archive\|private'; then
+  pass "untracked and credential-shaped logs never enter a commit"
+else
+  fail "untracked and credential-shaped logs never enter a commit"
 fi
 
-# --- 4b. Harness parity -----------------------------------------------------
-section "4b. Harness parity"
+HOME="$MIG" bash "$MIGRATE" archive --vault "$MV" --scope rules --apply >/dev/null 2>&1
+if [ ! -e "$MV/AGNT" ] && [ ! -e "$MV/_SYS/JDEX_AGNT.base" ] \
+   && git -C "$MIG/repo" diff --cached --name-status | grep -q '^R100'; then
+  pass "archive --scope rules moves rules with git mv"
+else
+  fail "archive --scope rules moves rules with git mv"
+fi
+(cd "$MIG/repo" && git commit -qm "archive rules")
+
+if [ "$(sha256sum <"$MV/JRNL/2026/04/2026-04-24.md")" = "$DAILY_SUM" ] \
+   && [ "$(sha256sum <"$MV/LIFE/20-Personal Development/21-Learnings/LIFE.21.01-Tests-document-intent.md")" = "$LIFE_SUM" ]; then
+  pass "personal journals and curated notes are untouched by the archive"
+else
+  fail "personal journals and curated notes are untouched by the archive"
+fi
+MANIFEST_BLOB=$(git -C "$MIG/repo" rev-parse HEAD:vaults/demo/.archive/agent-memory/MANIFEST.tsv)
+[ "$(blob_sum "$MANIFEST_BLOB")" = "$(git -C "$MIG/repo" ls-tree -r HEAD~2 | awk -v s="$SECRET_BLOB" '$3 != s {print $3}' | LC_ALL=C sort | sha256sum)" ] \
+  && pass "every file kept in Git keeps identical content" \
+  || fail "every file kept in Git keeps identical content"
+
+# Hidden paths are outside the MCP's index and Obsidian's file list.
+if [ -z "$(cd "$MV" && find . -mindepth 1 -name '.*' -prune -o -path './AGNT/*' -print -o -path './JRNL/AGNT/*' -print)" ]; then
+  pass "no legacy note remains on an indexed path"
+else
+  fail "no legacy note remains on an indexed path"
+fi
+
+HOME="$MIG" bash "$MIGRATE" restore --vault "$MV" --private-dir "$PRIV" --apply >/dev/null 2>&1
+git -C "$MIG/repo" add -- vaults/demo/JRNL/AGNT/2026-04-24-1500.md
+if [ "$(tree_sum)" = "$BASE_TREE" ] && [ ! -e "$MV/.archive" ] && [ ! -e "$PRIV" ] \
+   && [ -z "$(git -C "$MIG/repo" diff --cached --stat HEAD~2)" ] \
+   && [ "$(git -C "$MIG/repo" status --porcelain | grep '^??')" = "$BASE_STATUS" ]; then
+  pass "restore returns both archives to the original tree"
+else
+  fail "restore returns both archives to the original tree" "$(git -C "$MIG/repo" status --short | head -3 | tr '\n' ' ')"
+fi
+
+# --- 4c. Interrupted migrations ---
+# A stand-in command kills the migration script with SIGKILL, as a crash or a
+# power cut would, on the Nth call whose arguments contain a marker. No trap
+# runs, so the lock is left behind too.
+crash_on() {
+  local real
+  real=$(command -v "$1")
+  CRASH_BIN=$(mktemp -d)
+  cat >"$CRASH_BIN/$1" <<SHIM
+#!/bin/bash
+if [[ " \$* " == *"$2"* ]]; then
+  n=\$(( \$(cat "$CRASH_BIN/count" 2>/dev/null || echo 0) + 1 ))
+  echo "\$n" >"$CRASH_BIN/count"
+  [ "\$n" = "$3" ] && { kill -9 "\$PPID"; exit 137; }
+fi
+exec "$real" "\$@"
+SHIM
+  chmod +x "$CRASH_BIN/$1"
+}
+crashed() { (PATH="$CRASH_BIN:$PATH" HOME="$MIG" bash "$MIGRATE" "$@") >/dev/null 2>&1; }
+migrate() { HOME="$MIG" bash "$MIGRATE" "$@" >/dev/null 2>&1; }
+LOCK_DIR="$MIG/repo/.git/agent-memory-migrate.lock"
+# The vault matches the base commit, with the restore hint for the one
+# tracked private file applied.
+at_base() {
+  git -C "$MIG/repo" add -- vaults/demo/JRNL/AGNT/2026-04-24-1500.md 2>/dev/null
+  [ "$(tree_sum)" = "$BASE_TREE" ] && [ ! -e "$MV/.archive" ] && [ ! -e "$PRIV" ] \
+    && [ ! -e "$LOCK_DIR" ] && git -C "$MIG/repo" diff --cached --quiet "$BASE_COMMIT" \
+    && [ "$(git -C "$MIG/repo" status --porcelain | grep '^??')" = "$BASE_STATUS" ]
+}
+LOGS=(archive --vault "$MV" --scope logs --private-dir "$PRIV" --allow-inbound-links --apply --yes)
+git -C "$MIG/repo" reset -q "$BASE_COMMIT"
+
+crash_on git " mv " 2
+crashed archive --vault "$MV" --scope rules --apply
+rc=$?
+[ "$rc" = 137 ] && [ -d "$LOCK_DIR" ] \
+  && [ "$(find "$MV/.archive/agent-memory" -type f ! -name MANIFEST.tsv | wc -l)" = 1 ] \
+  && migrate restore --vault "$MV" --apply && at_base \
+  && pass "restore undoes an archive killed between git mv calls" \
+  || fail "restore undoes an archive killed between git mv calls" "exit $rc"
+rm -rf "$CRASH_BIN"
+
+crash_on git " mv " 2
+crashed archive --vault "$MV" --scope rules --apply
+rc=$?
+migrate archive --vault "$MV" --scope rules --apply
+if [ "$rc" = 137 ] && [ ! -e "$MV/AGNT" ] && [ ! -e "$MV/_SYS/JDEX_AGNT.base" ] \
+   && [ "$(grep -c '^file' "$MV/.archive/agent-memory/MANIFEST.tsv")" = 3 ] \
+   && [ "$(git -C "$MIG/repo" diff --cached --name-status | grep -c '^R100')" = 3 ]; then
+  pass "re-running archive finishes a Git archive killed midway"
+else
+  fail "re-running archive finishes a Git archive killed midway"
+fi
+migrate restore --vault "$MV" --apply && at_base || fail "restore after a resumed Git archive"
+rm -rf "$CRASH_BIN"
+
+# Killed after the private copy of a tracked log is recorded and unstaged,
+# before the original is deleted, so both copies exist.
+crash_on rm "JRNL/AGNT/2026-04-24-1500.md" 1
+crashed "${LOGS[@]}"
+rc=$?
+[ "$rc" = 137 ] && [ -f "$MV/JRNL/AGNT/2026-04-24-1500.md" ] && [ -f "$PRIV/JRNL/AGNT/2026-04-24-1500.md" ] \
+  && migrate restore --vault "$MV" --private-dir "$PRIV" --apply && at_base \
+  && pass "restore undoes an archive killed before a private original was removed" \
+  || fail "restore undoes an archive killed before a private original was removed" "exit $rc"
+rm -rf "$CRASH_BIN"
+
+crash_on rm "JRNL/AGNT/2026-04-24-1500.md" 1
+crashed "${LOGS[@]}"
+rc=$?
+migrate "${LOGS[@]}"
+if [ "$rc" = 137 ] && [ ! -e "$MV/JRNL/AGNT" ] && [ -f "$PRIV/JRNL/AGNT/2026-04-24-1500.md" ] \
+   && [ -f "$PRIV/JRNL/AGNT/2026-04-25-0900.md" ] \
+   && [ "$(grep -c '^file' "$PRIV/PRIVATE-MANIFEST.tsv")" = 2 ] \
+   && (cd "$PRIV" && awk -F'\t' '$1 == "file" { print $2 "  " $5 }' PRIVATE-MANIFEST.tsv | sha256sum -c --quiet) \
+   && ! git -C "$MIG/repo" ls-files --error-unmatch vaults/demo/JRNL/AGNT/2026-04-24-1500.md >/dev/null 2>&1; then
+  pass "re-running archive finishes a private archive killed midway"
+else
+  fail "re-running archive finishes a private archive killed midway"
+fi
+migrate restore --vault "$MV" --private-dir "$PRIV" --apply && at_base || fail "restore after a resumed private archive"
+rm -rf "$CRASH_BIN"
+
+# Killed while the second private copy still has its temporary name.
+crash_on mv ".agent-memory-partial" 2
+crashed "${LOGS[@]}"
+rc=$?
+[ "$rc" = 137 ] && [ -n "$(find "$PRIV" -name '*.agent-memory-partial')" ] \
+  && [ ! -e "$PRIV/JRNL/AGNT/2026-04-25-0900.md" ] \
+  && migrate restore --vault "$MV" --private-dir "$PRIV" --apply && at_base \
+  && pass "restore undoes an archive killed mid-copy and removes the partial copy" \
+  || fail "restore undoes an archive killed mid-copy and removes the partial copy" "exit $rc"
+rm -rf "$CRASH_BIN"
+
+# One altered archive file stops the restore before anything moves.
+migrate "${LOGS[@]}"
+ARCHIVED="$MV/.archive/agent-memory/JRNL/AGNT/2026-04-23-1000.md"
+cp "$ARCHIVED" "$MIG/saved.md"
+echo "edited" >>"$ARCHIVED"
+migrate restore --vault "$MV" --private-dir "$PRIV" --apply
+rc=$?
+[ "$rc" = 2 ] && [ ! -e "$MV/JRNL/AGNT" ] && [ -f "$PRIV/JRNL/AGNT/2026-04-24-1500.md" ] \
+  && [ -f "$PRIV/PRIVATE-MANIFEST.tsv" ] && [ -f "$MV/.archive/agent-memory/MANIFEST.tsv" ] \
+  && pass "restore checks every checksum before it moves anything" \
+  || fail "restore checks every checksum before it moves anything" "exit $rc"
+cp "$MIG/saved.md" "$ARCHIVED"
+migrate restore --vault "$MV" --private-dir "$PRIV" --apply && at_base || fail "restore after a checksum refusal"
+
+# A manifest path outside the legacy folders stops restore before it reads,
+# copies, or deletes anything. "../victim.md" from the private archive is a
+# file beside it, and following the path would move that file into vaults/.
+migrate "${LOGS[@]}"
+printf 'outside the archive\n' >"$MIG/private/victim.md"
+cp "$PRIV/PRIVATE-MANIFEST.tsv" "$MIG/saved.tsv"
+printf 'file\t%s\ttracked\trequested\t../victim.md\n' \
+  "$(sha256sum "$MIG/private/victim.md" | cut -d' ' -f1)" >>"$PRIV/PRIVATE-MANIFEST.tsv"
+migrate restore --vault "$MV" --private-dir "$PRIV" --apply
+rc_private=$?
+cp "$MIG/saved.tsv" "$PRIV/PRIVATE-MANIFEST.tsv"
+GM="$MV/.archive/agent-memory/MANIFEST.tsv"
+cp "$GM" "$MIG/saved.tsv"
+awk -F'\t' -v OFS='\t' '$NF == "JRNL/AGNT/2026-04-23-1000.md" { $NF = "LIFE/2026-04-23-1000.md" } 1' \
+  "$MIG/saved.tsv" >"$GM"
+migrate restore --vault "$MV" --private-dir "$PRIV" --apply
+rc_git=$?
+cp "$MIG/saved.tsv" "$GM"
+[ "$rc_private" = 2 ] && [ "$rc_git" = 2 ] && [ -f "$MIG/private/victim.md" ] \
+  && [ ! -e "$MIG/repo/vaults/victim.md" ] && [ ! -e "$MV/JRNL/AGNT" ] && [ ! -e "$MV/LIFE/2026-04-23-1000.md" ] \
+  && pass "restore refuses manifest paths outside the legacy folders" \
+  || fail "restore refuses manifest paths outside the legacy folders" "private $rc_private, git $rc_git"
+rm -f "$MIG/private/victim.md"
+migrate restore --vault "$MV" --private-dir "$PRIV" --apply && at_base || fail "restore after a path refusal"
+
+# A symlinked folder on either side of a move stops the run before anything
+# goes through it: JRNL/AGNT in the vault, a folder in the private archive,
+# or .archive before archive creates it.
+OUTSIDE="$MIG/outside"
+mkdir -p "$OUTSIDE"
+migrate "${LOGS[@]}"
+ln -s "$OUTSIDE" "$MV/JRNL/AGNT"
+migrate restore --vault "$MV" --private-dir "$PRIV" --apply
+rc_vault=$?
+rm "$MV/JRNL/AGNT"
+mv "$PRIV/JRNL/AGNT" "$OUTSIDE/AGNT" && ln -s "$OUTSIDE/AGNT" "$PRIV/JRNL/AGNT"
+migrate restore --vault "$MV" --private-dir "$PRIV" --apply
+rc_private=$?
+rm "$PRIV/JRNL/AGNT" && mv "$OUTSIDE/AGNT" "$PRIV/JRNL/AGNT"
+outside_empty=$(find "$OUTSIDE" -mindepth 1 | wc -l)
+migrate restore --vault "$MV" --private-dir "$PRIV" --apply && at_base || fail "restore after a symlink refusal"
+ln -s "$OUTSIDE" "$MV/.archive"
+migrate archive --vault "$MV" --scope rules --apply
+rc_archive=$?
+rm "$MV/.archive"
+[ "$rc_vault" = 2 ] && [ "$rc_private" = 2 ] && [ "$rc_archive" = 2 ] && [ "$outside_empty" = 0 ] \
+  && [ -z "$(find "$OUTSIDE" -mindepth 1)" ] && at_base \
+  && pass "archive and restore refuse to move files through a symlinked folder" \
+  || fail "archive and restore refuse to move files through a symlinked folder" \
+       "vault $rc_vault, private $rc_private, archive $rc_archive, outside $outside_empty"
+
+# A live process holding the lock blocks both commands.
+sleep 30 &
+LIVE=$!
+mkdir "$LOCK_DIR" && echo "$LIVE" >"$LOCK_DIR/pid"
+migrate "${LOGS[@]}"
+rc_archive=$?
+migrate restore --vault "$MV" --private-dir "$PRIV" --apply
+rc_restore=$?
+[ "$rc_archive" = 2 ] && [ "$rc_restore" = 2 ] && [ "$(tree_sum)" = "$BASE_TREE" ] && [ ! -e "$PRIV" ] \
+  && pass "a running migration blocks a second archive or restore" \
+  || fail "a running migration blocks a second archive or restore" "archive $rc_archive, restore $rc_restore"
+kill "$LIVE" 2>/dev/null
+wait "$LIVE" 2>/dev/null
+rm -rf "$LOCK_DIR"
+
+# A second vault with the same folder name, pointed at the first vault's
+# private archive, is refused before it reads or writes anything there.
+migrate "${LOGS[@]}"
+OTHER="$MIG/other/demo"
+mkdir -p "$OTHER/JRNL/AGNT"
+printf '# Session log\n\nAnother vault.\n' >"$OTHER/JRNL/AGNT/2026-05-01-0800.md"
+PSUM=$(cd "$PRIV" && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum)
+migrate archive --vault "$OTHER" --private-dir "$PRIV" --apply --yes
+rc_archive=$?
+migrate restore --vault "$OTHER" --private-dir "$PRIV" --apply
+rc_restore=$?
+[ "$rc_archive" = 2 ] && [ "$rc_restore" = 2 ] && [ -f "$OTHER/JRNL/AGNT/2026-05-01-0800.md" ] \
+  && [ ! -e "$OTHER/JRNL/AGNT/2026-04-24-1500.md" ] \
+  && [ "$(cd "$PRIV" && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum)" = "$PSUM" ] \
+  && pass "a private archive refuses a vault that did not write it" \
+  || fail "a private archive refuses a vault that did not write it" "archive $rc_archive, restore $rc_restore"
+migrate restore --vault "$MV" --private-dir "$PRIV" --apply && at_base || fail "restore after an owner refusal"
+
+rm -rf "$MIG"
+
+# --- 5. Harness parity -----------------------------------------------------
+section "5. Harness parity"
 
 # The four setup scripts are hand-maintained, so the generator cannot keep them
 # aligned. These assert the contract they are all supposed to honour.
@@ -482,163 +936,8 @@ for h in claude codex gemini opencode; do
     || fail "$f honours the setup contract" "missing:$missing"
 done
 
-# Every SessionStart hook must behave identically on both paths. The Gemini one
-# is generated inside a heredoc, so it is extracted and executed the same way
-# the setup script would write it. A degradation fix landed for Claude and
-# Codex before Gemini once already; this is what catches that next time.
-HOOK_DIR=$(mktemp -d)
-CONTEXT_TARGET="$WORK_DIR/scripts/agent-memory-context.sh"
-export CONTEXT_TARGET
-sed -n '/^cat >"\$HOOK_SCRIPT" <<EOF$/,/^EOF$/p' .gemini/setup-environment.sh \
-  | sed '1d;$d' >"$HOOK_DIR/raw"
-if [ -s "$HOOK_DIR/raw" ]; then
-  eval "cat <<EOF
-$(cat "$HOOK_DIR/raw")
-EOF" >"$HOOK_DIR/gemini-hook.sh"
-  pass "Gemini hook is extractable from the setup heredoc"
-else
-  fail "Gemini hook is extractable from the setup heredoc"
-fi
-
-HOOKS=(".claude/hooks/session-start.sh" ".codex/hooks/session-start.sh" "$HOOK_DIR/gemini-hook.sh")
-
-# Path 1: a working context script yields real content.
-ok=1
-for hk in "${HOOKS[@]}"; do
-  [ -f "$hk" ] || { ok=0; echo "       missing hook: $hk"; continue; }
-  ctx=$(bash "$hk" 2>/dev/null | jq -r '.hookSpecificOutput.additionalContext // ""')
-  case "$ctx" in
-    *"Agent Memory SOPs"*) ;;
-    *) ok=0; echo "       $hk did not emit SOPs (got ${#ctx} chars)" ;;
-  esac
-done
-[ "$ok" = 1 ] && pass "all SessionStart hooks emit SOPs on the success path" \
-  || fail "all SessionStart hooks emit SOPs on the success path"
-
-# Path 2: a failing context script must still yield a diagnostic, never an
-# empty context and never a false claim of success.
-CTX_SAVE=$(mktemp)
-cp scripts/agent-memory-context.sh "$CTX_SAVE"
-printf '#!/bin/bash\necho "simulated failure" >&2\nexit 1\n' >scripts/agent-memory-context.sh
-ok=1
-for hk in "${HOOKS[@]}"; do
-  [ -f "$hk" ] || continue
-  outj=$(bash "$hk" 2>/dev/null)
-  ctx=$(echo "$outj" | jq -r '.hookSpecificOutput.additionalContext // ""')
-  [ -n "$ctx" ] || { ok=0; echo "       $hk emitted an empty context on failure"; }
-  # Gemini also carries a systemMessage; it must not claim success.
-  msg=$(echo "$outj" | jq -r '.systemMessage // ""')
-  case "$msg" in
-    *restored*) ok=0; echo "       $hk claims 'restored' while the context failed" ;;
-  esac
-done
-[ "$ok" = 1 ] && pass "all SessionStart hooks degrade honestly on failure" \
-  || fail "all SessionStart hooks degrade honestly on failure"
-cp "$CTX_SAVE" scripts/agent-memory-context.sh
-rm -f "$CTX_SAVE"
-rm -rf "$HOOK_DIR"
-
-# --- 5. Session compiler ----------------------------------------------------
-section "5. Session compiler"
-
-check "compile-sessions.sh handles no logs" \
-  env AI_MEMORY_DRY_RUN=1 bash scripts/compile-sessions.sh 1
-
-# macOS and other BSD hosts expose date -j/-v rather than GNU date -d. Keep a
-# stub first on PATH so this Linux-run suite also exercises that branch.
-DATE_STUB_DIR=$(mktemp -d)
-cat >"$DATE_STUB_DIR/date" <<'DATE_STUB'
-#!/bin/bash
-if [ "${1:-}" = "-d" ]; then
-  exit 1
-fi
-case " $* " in
-  *" -j -f %Y-%m-%d 1970-01-01 +%s "*) echo 0 ;;
-  *" -v-1d +%s "*) echo 1700000000 ;;
-  *" -j -f %Y-%m-%d 2026-08-01 +%s "*) echo 1785542400 ;;
-  *" -j -v+1d -f %Y-%m-%d 2026-08-02 +%s "*) echo 1785715200 ;;
-  *) exit 1 ;;
-esac
-DATE_STUB
-chmod +x "$DATE_STUB_DIR/date"
-check "compile-sessions.sh supports BSD relative dates" \
-  env PATH="$DATE_STUB_DIR:$PATH" AI_MEMORY_DRY_RUN=1 bash scripts/compile-sessions.sh 1
-check "compile-sessions.sh supports BSD date ranges" \
-  env PATH="$DATE_STUB_DIR:$PATH" AI_MEMORY_DRY_RUN=1 bash scripts/compile-sessions.sh 2026-08-01 2026-08-02
-rm -rf "$DATE_STUB_DIR"
-
-# Actually execute the generated wrapper. Checking only that the file exists
-# once let a broken repo-root expression ship: the wrapper resolved to two
-# newline-joined paths and could not exec the compiler at all.
-WRAPPER=.gemini/skills/librarian-vault-manager/scripts/compile-sessions.sh
-out=$(AI_MEMORY_DRY_RUN=1 bash "$WRAPPER" 1 2>&1)
-if echo "$out" | grep -q 'Scanning for agent CLI session logs'; then
-  pass "generated wrapper execs the compiler"
-else
-  fail "generated wrapper execs the compiler" "$(echo "$out" | tail -1)"
-fi
-
-# The wrapper must resolve from its own location, not the caller's cwd.
-out=$(cd / && AI_MEMORY_DRY_RUN=1 bash "$WORK_DIR/$WRAPPER" 1 2>&1)
-if echo "$out" | grep -q 'Scanning for agent CLI session logs'; then
-  pass "generated wrapper works from an unrelated cwd"
-else
-  fail "generated wrapper works from an unrelated cwd" "$(echo "$out" | tail -1)"
-fi
-
-out=$(AI_MEMORY_HOST=bogus AI_MEMORY_DRY_RUN=1 bash scripts/compile-sessions.sh 1 2>&1)
-echo "$out" | grep -q 'No session logs found' && pass "reports empty log set cleanly" \
-  || fail "reports empty log set cleanly" "$out"
-
-# Synthesize a Claude Code transcript and confirm it is extracted.
-mkdir -p "$HOME/.claude/projects/-test"
-cat >"$HOME/.claude/projects/-test/session.jsonl" <<'JSONL'
-{"type":"user","message":{"role":"user","content":"always use pytest for python tests"}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Understood, pytest it is."}]}}
-{"type":"user","message":{"role":"user","content":[{"tool_use_id":"x","type":"tool_result","content":"noise"}]}}
-JSONL
-comp=$(AI_MEMORY_DRY_RUN=dump bash scripts/compile-sessions.sh 1 2>/dev/null)
-echo "$comp" | grep -q '\[user\] always use pytest' && pass "extracts Claude user turns" \
-  || fail "extracts Claude user turns"
-echo "$comp" | grep -q '\[assistant\] Understood' && pass "extracts Claude assistant turns" \
-  || fail "extracts Claude assistant turns"
-echo "$comp" | grep -q 'tool_result' && fail "filters Claude tool_result noise" \
-  || pass "filters Claude tool_result noise"
-
-# Synthesize an OpenCode SQLite store and confirm it is extracted.
-OCDB="$HOME/.local/share/opencode/opencode.db"
-mkdir -p "$(dirname "$OCDB")"
-NOW_MS=$(( $(date +%s) * 1000 ))
-sqlite3 "$OCDB" "
-  CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
-  CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
-  INSERT INTO message VALUES ('m1','s1',$NOW_MS,$NOW_MS,'{\"role\":\"user\"}');
-  INSERT INTO part VALUES ('p1','m1','s1',$NOW_MS,$NOW_MS,'{\"type\":\"text\",\"text\":\"prefer vitest in this repo\"}');
-" 2>/dev/null
-comp=$(AI_MEMORY_DRY_RUN=dump bash scripts/compile-sessions.sh 1 2>/dev/null)
-echo "$comp" | grep -q 'prefer vitest in this repo' && pass "extracts OpenCode SQLite turns" \
-  || fail "extracts OpenCode SQLite turns"
-
-out=$(AI_MEMORY_HOST=bogus bash scripts/compile-sessions.sh 1 2>&1)
-echo "$out" | grep -q 'Unsupported AI_MEMORY_HOST' && pass "rejects unknown AI_MEMORY_HOST" \
-  || fail "rejects unknown AI_MEMORY_HOST"
-
-# A transcript holding only tool-call noise must not produce a payload of bare
-# separators, which would look non-empty and invoke a reviewer on nothing.
-rm -rf "$HOME/.claude/projects" "$HOME/.local/share/opencode"
-mkdir -p "$HOME/.claude/projects/-noise"
-echo '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"x","type":"tool_result","content":"noise"}]}}' \
-  >"$HOME/.claude/projects/-noise/s.jsonl"
-out=$(AI_MEMORY_DRY_RUN=1 bash scripts/compile-sessions.sh 1 2>&1)
-if echo "$out" | grep -q 'No session logs found'; then
-  pass "noise-only transcript reports no logs"
-else
-  fail "noise-only transcript reports no logs" "$(echo "$out" | tail -1)"
-fi
-rm -rf "$HOME/.claude/projects"
-
 # --- 6. Migration script ----------------------------------------------------
-section "6. Migration script"
+section "6. v2 migration script"
 
 printf 'legacy\n' >.gitattributes
 echo '.gemini-obsidian/**/*.lance filter=lfs diff=lfs merge=lfs -text' >>.gitattributes
